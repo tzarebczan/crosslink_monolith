@@ -1474,6 +1474,39 @@ async fn tfl_service_incoming_request(
                 total_issuance_from_key(internal_handle.clone(), ufvk_str, first_height, last_height).await
             }))
         }
+        // Handle `staking_command` RPC sub-commands. Supported:
+        //   * "stake <amount_zats> <finalizer_hex>" -- queue a CreateNewDelegationBond
+        //   * "info"                                -- return JSON snapshot of wallet
+        //   * "wipe-snapshot"                       -- drop a marker file to wipe wallet persistence
+        //   * "help"                                -- list available sub-commands
+        //
+        // Hex is decoded in the natural (big-endian) byte order that matches
+        // the roster JSON's `pub_key` field. See `tools/sidecar/README.md`.
+        TFLServiceRequest::StakingCmd(cmd) => {
+            let result: Result<String, String> = (|| -> Result<String, String> {
+                let trimmed = cmd.trim();
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.is_empty() {
+                    return Err("empty command; try `help`".to_owned());
+                }
+                match parts[0] {
+                    "stake" => {
+                        if parts.len() != 3 {
+                            return Err("usage: stake <amount_zats> <finalizer_hex>".to_owned());
+                        }
+                        let amount: u64 = parts[1]
+                            .parse()
+                            .map_err(|e| format!("bad amount: {e}"))?;
+                        let finalizer_bytes = hex::decode(parts[2])
+                            .map_err(|e| format!("bad finalizer hex: {e}"))?;
+                        if finalizer_bytes.len() != 32 {
+                            return Err(format!(
+                                "finalizer must be 32 bytes (got {})",
+                                finalizer_bytes.len()
+                            ));
+                        }
+                        let mut finalizer = [0u8; 32];
+                        finalizer.copy_from_slice(&finalizer_bytes);
 
         // crosslink direct
         TFLServiceRequest::FinalizersRecencyStatus => {
@@ -1482,7 +1515,76 @@ async fn tfl_service_incoming_request(
             Ok(TFLServiceResponse::FinalizersRecencyStatus(internal.recency_status.clone()))
         }
 
-        TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
+        TFLServiceRequest::StakingCmd(cmd) => {
+            let result: Result<String, String> = (|| -> Result<String, String> {
+                let trimmed = cmd.trim();
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.is_empty() {
+                    return Err("empty command; try `help`".to_owned());
+                }
+                match parts[0] {
+                    "stake" => {
+                        if parts.len() != 3 {
+                            return Err("usage: stake <amount_zats> <finalizer_hex>".to_owned());
+                        }
+                        let amount: u64 = parts[1]
+                            .parse()
+                            .map_err(|e| format!("bad amount: {e}"))?;
+                        let finalizer_bytes = hex::decode(parts[2])
+                            .map_err(|e| format!("bad finalizer hex: {e}"))?;
+                        if finalizer_bytes.len() != 32 {
+                            return Err(format!(
+                                "finalizer must be 32 bytes (got {})",
+                                finalizer_bytes.len()
+                            ));
+                        }
+                        let mut finalizer = [0u8; 32];
+                        finalizer.copy_from_slice(&finalizer_bytes);
+
+                        let closure = wallet::STAKE_REQUEST.lock().unwrap();
+                        match closure.as_ref() {
+                            Some(closure) => (closure.0)(amount, finalizer).map(|_| "ok".to_owned()),
+                            None => Err("wallet not ready".to_owned()),
+                        }
+                    }
+                    "info" => {
+                        let closure = wallet::WALLET_INFO.lock().unwrap();
+                        match closure.as_ref() {
+                            Some(closure) => Ok((closure.0)()),
+                            None => Err("wallet not ready".to_owned()),
+                        }
+                    }
+                    // Drop a marker file the wallet picks up on next launch
+                    // and uses to wipe its persistence + start a fresh sync.
+                    // Takes effect at the next process restart -- the running
+                    // wallet keeps its in-memory state.
+                    "wipe-snapshot" => {
+                        let dir = wallet::WALLET_SNAPSHOT_DIR.lock().unwrap().clone();
+                        match dir {
+                            Some(d) => match wallet::persist::drop_wipe_marker(&d) {
+                                Ok(()) => Ok(format!(
+                                    "wipe marker written; restart zebrad to discard the snapshot ({:?})",
+                                    wallet::persist::wipe_marker_path(&d)
+                                )),
+                                Err(e) => Err(format!("could not write wipe marker: {e}"))),
+                            },
+                            None => Err("snapshot dir not configured".to_owned()),
+                        }
+                    }
+                    "help" => Ok(
+                        "sub-commands: `stake <amount_zats> <finalizer_hex>`, `info`, `wipe-snapshot`, `help`"
+                            .to_owned(),
+                    ),
+                    other => Err(format!("unknown sub-command: {other}; try `help`")),
+                }
+            })();
+
+            match result {
+                Ok(s) => Ok(TFLServiceResponse::StakingCmd(s)),
+                Err(e) => Err(TFLServiceError::Misc(e)),
+            }
+        }
+        _ => Err(TFLServiceError::NotImplemented),
     }
 }
 

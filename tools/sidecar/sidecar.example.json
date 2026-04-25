@@ -1,0 +1,11 @@
+{
+  "rpc_url": "http://127.0.0.1:8232",
+  "user_address": "",
+  "finalizer_hex": "",
+  "auto_faucet": false,
+  "auto_stake": false,
+  "faucet_interval_s": 30,
+  "stake_interval_s": 20,
+  "stake_max_denom_ctaz": "1",
+  "stake_min_denom_ctaz": "0.01"
+}

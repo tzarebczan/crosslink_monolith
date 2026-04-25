@@ -115,6 +115,58 @@ pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
 pub static RECENCY_REQUEST: Mutex<Option<RecencyRequestClosure>> = Mutex::new(None);
 
+/// A stake request queued by an external caller (e.g. the auto-stake sidecar)
+/// via the `staking_command` JSON-RPC. Drained by `wallet_main` each loop tick
+/// and pushed into the wallet's action queue.
+#[derive(Copy, Clone, Debug)]
+pub struct PendingStake {
+    pub amount_zats: u64,
+    pub finalizer: [u8; 32],
+}
+
+#[derive(Clone)]
+pub struct StakeRequestClosure(pub Arc<dyn Fn(u64, [u8; 32]) -> Result<(), String> + Sync + Send + 'static>);
+pub static STAKE_REQUEST: Mutex<Option<StakeRequestClosure>> = Mutex::new(None);
+
+/// Returns a JSON string snapshot of the current wallet state. Installed by
+/// `wallet_main` after it has the wallet_state handle.
+#[derive(Clone)]
+pub struct WalletInfoClosure(pub Arc<dyn Fn() -> String + Sync + Send + 'static>);
+pub static WALLET_INFO: Mutex<Option<WalletInfoClosure>> = Mutex::new(None);
+
+/// Reorg-resilience window for the orchard ShardTree. Matches the
+/// `CHECKPOINTS_N` that `wallet_main` configures. Public to the persist
+/// module so reload uses the same value.
+pub(crate) const ORCHARD_REORG_DEPTH: usize = 100;
+
+pub mod persist;
+
+/// Tracks how many times `audit_tx` has flagged a given txid in the current
+/// process. When it hits `AUDIT_AUTOMARK_THRESHOLD` we drop a wipe-on-next-
+/// start marker and stop pestering -- the operator restarts and resyncs.
+/// Behind a `Mutex<Option<HashMap>>` rather than a const-init `HashMap` to
+/// keep the static const-friendly without leaning on a specific MSRV.
+pub static AUDIT_FAIL_COUNTS: Mutex<Option<HashMap<TxId, u32>>> = Mutex::new(None);
+
+/// One-shot latch -- once we've dropped the marker once for a session we
+/// don't keep re-writing it on every subsequent failure.
+pub static AUDIT_MARKER_DROPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of consecutive `audit_tx` failures on the same txid before we
+/// auto-drop the wipe marker. 3 is enough to distinguish a one-shot blip
+/// from a genuinely stuck inconsistency, since `audit_txs()` re-walks the
+/// whole history every time `update_with_tx` fires.
+pub const AUDIT_AUTOMARK_THRESHOLD: u32 = 3;
+
+/// Aggregate-failure threshold: if the wallet sprays audit errors across
+/// many distinct txids (each below the per-txid threshold), the wallet is
+/// still demonstrably in a bad state. Sum of all per-txid counts crossing
+/// this also drops the wipe marker. 30 is loose enough to ignore a small
+/// burst during initial sync but tight enough to catch a wallet whose
+/// note-tracking is broadly out of sync.
+pub const AUDIT_AUTOMARK_TOTAL_THRESHOLD: u32 = 30;
+
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -201,7 +253,7 @@ impl std::fmt::Display for LEHash {
 
 // if unspent, this is a UTXO; the notion of a "spent unspent transaction output" is slightly silly
 #[derive(Clone, Debug, PartialEq)]
-struct Txo {
+pub(crate) struct Txo {
     pub recv_h: BlockHeight,
     pub spent_h: BlockHeight,
     pub id: OutPoint, // txid + index in tx // (kind of nullifier-like)
@@ -243,7 +295,7 @@ fn unknown_tree_position() -> incrementalmerkletree::Position { incrementalmerkl
 
 // ALT: collapse into Txo with internal enum(s)
 #[derive(Clone, Copy, PartialEq)]
-struct OrchardNote {
+pub(crate) struct OrchardNote {
     // NOTE: the reason we want to keep witnesses up-to-date is to increase the time-domain anonymity
     pub recv_h: BlockHeight,
     pub spent_h: BlockHeight,
@@ -384,6 +436,12 @@ impl ProposedTx {
 const CHEAT_UNSTAKING: bool = false;
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+/// Directory under which the wallet looks for / writes its snapshot file
+/// (see `persist.rs`). zebrad sets this to `state.cache_dir` before spawning
+/// `wallet_main`. If `None` at the point `wallet_main` consults it, snapshot
+/// persistence is disabled and every restart is a full sync.
+pub static WALLET_SNAPSHOT_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
 
@@ -2128,6 +2186,67 @@ impl ManualWallet {
                             println!("Note log: {:?}", NL(&tx_log));
                         }
                     }
+                    // Auto-marker: drop the wipe-on-next-start marker when
+                    // audit failures look stuck rather than transient. Two
+                    // independent triggers, OR'd:
+                    //   * same txid hit AUDIT_AUTOMARK_THRESHOLD (3)
+                    //   * sum of all failures across distinct txids hit
+                    //     AUDIT_AUTOMARK_TOTAL_THRESHOLD (30) -- catches the
+                    //     spray-across-many-txids pattern that the per-txid
+                    //     threshold alone would miss.
+                    // Latched via AUDIT_MARKER_DROPPED so we only write the
+                    // marker once per session.
+                    let trigger: Option<&'static str> = {
+                        let mut guard = AUDIT_FAIL_COUNTS.lock().unwrap();
+                        let counts = guard.get_or_insert_with(HashMap::new);
+                        let n = counts.entry(tx.txid).and_modify(|c| *c += 1).or_insert(1);
+                        let per_txid = *n;
+                        let total: u32 = counts.values().copied().sum();
+                        let already_dropped = AUDIT_MARKER_DROPPED
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if already_dropped {
+                            None
+                        } else if per_txid >= AUDIT_AUTOMARK_THRESHOLD {
+                            Some("per-txid")
+                        } else if total >= AUDIT_AUTOMARK_TOTAL_THRESHOLD {
+                            Some("total")
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(trigger) = trigger {
+                        AUDIT_MARKER_DROPPED
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let (per_txid, total, distinct) = {
+                            let guard = AUDIT_FAIL_COUNTS.lock().unwrap();
+                            match guard.as_ref() {
+                                Some(m) => (
+                                    m.get(&tx.txid).copied().unwrap_or(0),
+                                    m.values().copied().sum::<u32>(),
+                                    m.len(),
+                                ),
+                                None => (0, 0, 0),
+                            }
+                        };
+                        let dir = WALLET_SNAPSHOT_DIR.lock().unwrap().clone();
+                        if let Some(d) = dir {
+                            match crate::persist::drop_wipe_marker(&d) {
+                                Ok(()) => println!(
+                                    "wallet: persistent audit failure (trigger={trigger}, per_txid={per_txid}/{}, total={total}/{}, distinct_txids={distinct}) -- dropped wipe-on-next-start marker. RESTART zebrad to resync. Marker: {:?}",
+                                    AUDIT_AUTOMARK_THRESHOLD,
+                                    AUDIT_AUTOMARK_TOTAL_THRESHOLD,
+                                    crate::persist::wipe_marker_path(&d),
+                                ),
+                                Err(e) => println!(
+                                    "wallet: tried to drop wipe marker after persistent audit failure (trigger={trigger}) but failed: {e}"
+                                ),
+                            }
+                        } else {
+                            println!(
+                                "wallet: persistent audit failure (trigger={trigger}) but WALLET_SNAPSHOT_DIR not set; can't drop marker. Wipe manually."
+                            );
+                        }
+                    }
                 }
                 ok = true; // breakpoint
             }
@@ -2145,7 +2264,7 @@ impl ManualWallet {
     }
 }
 
-struct PoWCache {
+pub(crate) struct PoWCache {
     pub hashes: Vec<[u8; 32]>,
     // pub hashes: [[u8;32]; 512],
     // pub h_o: usize, // trails tip
@@ -2686,7 +2805,7 @@ type OrchardTree = incrementalmerkletree::frontier::CommitmentTree<orchard::tree
 type OrchardFrontier = incrementalmerkletree::frontier::Frontier<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
 type OrchardWitness = incrementalmerkletree::witness::IncrementalWitness<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
 const SHARD_HEIGHT: u8 = 16; // default => 65536 leaves per shard
-type OrchardShardTree = shardtree::ShardTree::<
+pub(crate) type OrchardShardTree = shardtree::ShardTree::<
     shardtree::store::memory::MemoryShardStore::<
         orchard::tree::MerkleHashOrchard,
         // shardtree::Node<orchard::tree::MerkleHashOrchard, (), ()>,
@@ -2727,6 +2846,23 @@ static FAUCET_Q: Mutex<FaucetQ> = Mutex::new(FaucetQ {
 });
 const TEST_FAUCET: bool = false;
 const FAUCET_VALUE: u64 = 50_000_000;
+
+const STAKE_Q_LEN: usize = 16;
+struct StakeQ {
+    pub read_o: u8,
+    pub write_o: u8,
+    pub data: [Option<PendingStake>; STAKE_Q_LEN],
+}
+impl StakeQ {
+    fn len(&self) -> usize {
+        self.write_o.wrapping_sub(self.read_o).into()
+    }
+}
+static STAKE_Q: Mutex<StakeQ> = Mutex::new(StakeQ {
+    read_o: 0,
+    write_o: 0,
+    data: [None; STAKE_Q_LEN],
+});
 
 // CHEAT
 fn user_view_of_faucet_tx(tx: &WalletTx) -> WalletTx {
@@ -3216,6 +3352,92 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         Ok(FAUCET_VALUE)
     })));
 
+    // Install the stake request closure. Callers (typically the auto-stake
+    // sidecar via the `staking_command` RPC) push a `(amount_zats, finalizer)`
+    // pair onto STAKE_Q, which is drained by the wallet loop below.
+    *STAKE_REQUEST.lock().unwrap() = Some(StakeRequestClosure(Arc::new(|amount_zats: u64, finalizer: [u8; 32]| -> Result<(), String> {
+        if amount_zats == 0 {
+            return Err(format!("amount_zats must be > 0"));
+        }
+        let mut q = STAKE_Q.lock().unwrap();
+        if q.len() == q.data.len() {
+            return Err(format!("stake queue full, come back later"));
+        }
+        let i = q.write_o as usize % q.data.len();
+        q.write_o += 1;
+        q.data[i] = Some(PendingStake { amount_zats, finalizer });
+        Ok(())
+    })));
+
+    // Install the wallet info closure. Returns a hand-crafted JSON snapshot
+    // of the current wallet state so the sidecar can display balances.
+    *WALLET_INFO.lock().unwrap() = Some(WalletInfoClosure(Arc::new({
+        let wallet_state = wallet_state.clone();
+        move || -> String {
+            // Escape a string for JSON (minimally sufficient for our address fields).
+            fn j(s: &str) -> String {
+                let mut out = String::with_capacity(s.len() + 2);
+                out.push('"');
+                for c in s.chars() {
+                    match c {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+                out
+            }
+            let s = wallet_state.lock().unwrap();
+            format!(
+                "{{\
+\"user_balance_zats\":{ub},\
+\"user_shielded_spendable\":{uss},\
+\"user_shielded_pending\":{usp},\
+\"user_unshielded\":{uun},\
+\"user_address\":{ua},\
+\"miner_balance_zats\":{mb},\
+\"miner_shielded_spendable\":{mss},\
+\"miner_shielded_pending\":{msp},\
+\"miner_unshielded\":{mun},\
+\"staked_zats\":{stk},\
+\"withdrawable_zats\":{wdr},\
+\"waiting_for_faucet\":{wff},\
+\"waiting_for_stake\":{wfs},\
+\"waiting_for_send\":{wfz},\
+\"wallet_sync_h\":{wsh},\
+\"wallet_tip_h\":{wth},\
+\"actions_in_flight\":{aif},\
+\"stake_positions_bonded\":{spb},\
+\"stake_positions_unbonded\":{spu}\
+}}",
+                ub = s.user_balance(),
+                uss = s.user_shielded_spendable_funds,
+                usp = s.user_shielded_pending_funds,
+                uun = s.user_unshielded_funds,
+                ua = j(&s.user_recv_ua),
+                mb = s.miner_balance(),
+                mss = s.miner_shielded_spendable_funds,
+                msp = s.miner_shielded_pending_funds,
+                mun = s.miner_unshielded_funds,
+                stk = s.staked_balance,
+                wdr = s.withdrawable_balance,
+                wff = s.waiting_for_faucet,
+                wfs = s.waiting_for_stake_to_finalizer,
+                wfz = s.waiting_for_send,
+                wsh = s.wallets_sync_h,
+                wth = s.wallets_tip_h,
+                aif = s.actions_in_flight.len(),
+                spb = s.stake_positions_bonded.len(),
+                spu = s.stake_positions_unbonded.len(),
+            )
+        }
+    })));
+
 
     let (
         mut miner_wallet,
@@ -3351,9 +3573,233 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut roster: Vec<RosterMember> = Vec::new();
     let mut pow_cache = PoWCache::new(0, genesis_hash);
     // NOTE: checkpoints allow us to reset the tree after a reorg & also create spend anchors
-    const CHECKPOINTS_N: usize = 100;
-    let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
+    let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), ORCHARD_REORG_DEPTH);
     orchard_tree.checkpoint(BlockHeight(0)).unwrap();
+
+    // ---- Snapshot resume / wipe handling --------------------------------
+    let snapshot_dir = WALLET_SNAPSHOT_DIR.lock().unwrap().clone();
+    let snapshot_path: Option<std::path::PathBuf> =
+        snapshot_dir.as_ref().map(|d| persist::snapshot_path(d));
+    let mut anchors = persist::AnchorHistory::default();
+    let mut last_saved_h: u32 = 0;
+
+    if let Some(d) = snapshot_dir.as_ref() {
+        match persist::process_wipe_marker(d) {
+            Ok(true) => println!("wallet: wipe marker found, snapshot deleted (full resync)"),
+            Ok(false) => {}
+            Err(e) => println!("wallet: wipe marker check failed: {e:?}"),
+        }
+    }
+
+    if let Some(p) = snapshot_path.as_ref() {
+        match persist::load(p, zcash_protocol::consensus::NetworkType::Test, &genesis_hash) {
+            Ok(loaded) => {
+                let resumed_tip = loaded.miner_wallet.chain_tip_h.0
+                    .max(loaded.user_wallet.chain_tip_h.0);
+                println!(
+                    "wallet: resumed snapshot. miner_tip={} user_tip={} pow_cache_next={} anchors={}",
+                    loaded.miner_wallet.chain_tip_h.0,
+                    loaded.user_wallet.chain_tip_h.0,
+                    loaded.pow_cache.next_tip_h.saturating_sub(1),
+                    loaded.anchors.anchors.len(),
+                );
+                // ManualWallet.name is &'static str -- the on-disk version
+                // had the placeholder we passed in, so restore the runtime
+                // names from the wallets we just constructed.
+                let mut loaded_miner = loaded.miner_wallet;
+                let mut loaded_user = loaded.user_wallet;
+                loaded_miner.name = miner_wallet.name;
+                loaded_user.name = user_wallet.name;
+                miner_wallet = loaded_miner;
+                user_wallet = loaded_user;
+                orchard_tree = loaded.orchard_tree;
+                pow_cache = loaded.pow_cache;
+                anchors = loaded.anchors;
+                last_saved_h = resumed_tip;
+            }
+            Err(persist::PersistError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                println!("wallet: no snapshot found, starting fresh sync");
+            }
+            Err(e) => {
+                println!("wallet: snapshot load failed ({e}); discarding for full resync");
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    // ---- Reorg walkback (Phase 2) ---------------------------------------
+    //
+    // After a successful load, ask Zaino whether the chain still has the
+    // block hash we cached at the snapshot tip. If yes, we resume directly.
+    // If no, walk our anchor history newest-first looking for the deepest
+    // anchor whose recorded hash is still the chain's hash at that height,
+    // then truncate the loaded state down to that anchor. If no anchor
+    // matches at all the snapshot is unsalvageable -- nuke it and fall
+    // back to a fresh sync.
+    //
+    // Helper to fetch a 32-byte block hash at a given height. Returns
+    // `Found` on success, `OutOfRange` when Zaino tells us that height is
+    // past its tip (i.e. the chain is shorter than our snapshot), and
+    // `Transient` for transport / decoding failures we shouldn't act on.
+    enum FetchHashResult {
+        Found([u8; 32]),
+        OutOfRange,
+        Transient,
+    }
+
+    async fn fetch_block_hash(
+        client: &mut CompactTxStreamerClient<Channel>,
+        h: u32,
+    ) -> FetchHashResult {
+        match client
+            .get_block(BlockId {
+                height: h as u64,
+                hash: Vec::new(),
+            })
+            .await
+        {
+            Ok(b) => {
+                let v = b.into_inner().hash;
+                match <[u8; 32]>::try_from(&v[..]) {
+                    Ok(arr) => FetchHashResult::Found(arr),
+                    Err(_) => FetchHashResult::Transient,
+                }
+            }
+            Err(status) => {
+                if status.code() == tonic::Code::OutOfRange {
+                    FetchHashResult::OutOfRange
+                } else {
+                    FetchHashResult::Transient
+                }
+            }
+        }
+    }
+
+    if last_saved_h > 0 {
+        let saved_tip_h = pow_cache.next_tip_h.saturating_sub(1) as u32;
+        let saved_tip_hash = pow_cache.tip_hash();
+        let tip_outcome = fetch_block_hash(&mut client, saved_tip_h).await;
+
+        let needs_walkback = match tip_outcome {
+            FetchHashResult::Found(h) if h == saved_tip_hash => {
+                println!("wallet: snapshot tip h={saved_tip_h} verified, resuming");
+                false
+            }
+            FetchHashResult::Found(_) => {
+                println!(
+                    "wallet: snapshot tip h={saved_tip_h} hash mismatch; walking {} anchors",
+                    anchors.anchors.len()
+                );
+                true
+            }
+            FetchHashResult::OutOfRange => {
+                println!(
+                    "wallet: snapshot tip h={saved_tip_h} is past chain tip (chain rolled back / cache cleared?); walking {} anchors",
+                    anchors.anchors.len()
+                );
+                true
+            }
+            FetchHashResult::Transient => {
+                println!(
+                    "wallet: couldn't verify snapshot tip h={saved_tip_h} (Zaino transient error); resuming as-is"
+                );
+                false
+            }
+        };
+
+        if needs_walkback {
+            let candidates: Vec<persist::Anchor> =
+                anchors.anchors.iter().rev().cloned().collect();
+            let mut found: Option<persist::Anchor> = None;
+            // Track whether Zaino actually returned a definitive answer
+            // (Found OR OutOfRange) for any anchor. If only Transient
+            // results came back, we treat it as a network blip and keep
+            // the snapshot rather than nuking it. OutOfRange counts as
+            // a real answer ("this height isn't on chain") so older
+            // anchors past the chain still trigger a clean reset.
+            let mut got_any_response = false;
+            for a in &candidates {
+                if a.height >= saved_tip_h {
+                    continue;
+                }
+                match fetch_block_hash(&mut client, a.height).await {
+                    FetchHashResult::Found(chain_h) => {
+                        got_any_response = true;
+                        if chain_h == a.hash {
+                            found = Some(a.clone());
+                            break;
+                        }
+                    }
+                    FetchHashResult::OutOfRange => {
+                        // Anchor is also past the chain; that's a definitive
+                        // answer, just keep walking older.
+                        got_any_response = true;
+                    }
+                    FetchHashResult::Transient => continue,
+                }
+            }
+
+            // Three outcomes: matched anchor -> truncate; no match but Zaino
+            // answered for at least one anchor -> genuine reorg below window,
+            // do the full reset; no responses at all -> assume transient,
+            // leave the snapshot alone and let the forward sync sort it out.
+            match (found, got_any_response) {
+                (Some(target), _) => {
+                    println!(
+                        "wallet: rolling back to anchor h={} (drop {} blocks of state)",
+                        target.height,
+                        saved_tip_h - target.height,
+                    );
+                    let target_bh = BlockHeight(target.height);
+                    persist::truncate_orchard_tree_to(&mut orchard_tree, target_bh);
+                    persist::truncate_pow_cache_to(&mut pow_cache, target.height);
+                    persist::truncate_wallet_to(&mut miner_wallet, target_bh);
+                    persist::truncate_wallet_to(&mut user_wallet, target_bh);
+                    persist::anchors_truncate_above(&mut anchors, target.height);
+                    persist::restore_stream_heights(
+                        &mut miner_wallet,
+                        &mut user_wallet,
+                        &target.stream_heights,
+                        target.height,
+                    );
+                    last_saved_h = target.height;
+                }
+                (None, true) => {
+                    println!(
+                        "wallet: no anchor matches chain; discarding snapshot for full resync"
+                    );
+                    pow_cache = PoWCache::new(0, genesis_hash);
+                    orchard_tree = OrchardShardTree::new(
+                        shardtree::store::memory::MemoryShardStore::empty(),
+                        ORCHARD_REORG_DEPTH,
+                    );
+                    orchard_tree.checkpoint(BlockHeight(0)).unwrap();
+                    persist::truncate_wallet_to(&mut miner_wallet, BlockHeight(0));
+                    persist::truncate_wallet_to(&mut user_wallet, BlockHeight(0));
+                    for s in &mut miner_wallet.strms {
+                        s.sync_h = BlockHeight(0);
+                    }
+                    for s in &mut user_wallet.strms {
+                        s.sync_h = BlockHeight(0);
+                    }
+                    anchors = persist::AnchorHistory::default();
+                    last_saved_h = 0;
+                    if let Some(p) = snapshot_path.as_ref() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                (None, false) => {
+                    println!(
+                        "wallet: Zaino didn't answer for any anchor; treating as transient and keeping snapshot. Forward sync will catch any drift."
+                    );
+                }
+            }
+        }
+        // No 'else' print here -- each branch of `tip_outcome` above already
+        // emitted its own status line.
+    }
 
     const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 64;
     // TODO: this is bad and should be replaced
@@ -4354,6 +4800,59 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
 
+        // ---- Periodic snapshot save -------------------------------------
+        //
+        // Push an anchor each tick + flush a snapshot every ~SAVE_EVERY_BLOCKS.
+        // Anchors are cheap (a few dozen bytes); the snapshot is the costly
+        // bit so we batch it.  Errors are logged and swallowed -- a save
+        // failure must never wedge the wallet loop.
+        if let Some(p) = snapshot_path.as_ref() {
+            const SAVE_EVERY_BLOCKS: u32 = 100;
+            let cur_tip = wallets_sync_h.0;
+            let progressed = cur_tip.saturating_sub(last_saved_h) >= SAVE_EVERY_BLOCKS;
+            if progressed && cur_tip > 0 {
+                let stream_heights: Vec<u32> = miner_wallet
+                    .strms
+                    .iter()
+                    .map(|s| s.sync_h.0)
+                    .chain(user_wallet.strms.iter().map(|s| s.sync_h.0))
+                    .collect();
+                let cur_hash = pow_cache.tip_hash();
+                anchors.push(persist::Anchor {
+                    height: cur_tip,
+                    hash: cur_hash,
+                    stream_heights,
+                });
+
+                match persist::serialize_orchard_tree(&mut orchard_tree) {
+                    Ok(blob) => {
+                        let snap = persist::Snapshot {
+                            network_type: zcash_protocol::consensus::NetworkType::Test,
+                            genesis_hash,
+                            miner_wallet: &miner_wallet,
+                            user_wallet: &user_wallet,
+                            orchard_tree_blob: blob,
+                            pow_cache: &pow_cache,
+                            anchors: &anchors,
+                        };
+                        if let Err(e) = persist::save(p, &snap) {
+                            println!("wallet: snapshot save failed at h={cur_tip}: {e}");
+                        } else {
+                            last_saved_h = cur_tip;
+                            println!(
+                                "wallet: snapshot saved at h={cur_tip} (anchors={})",
+                                anchors.anchors.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("wallet: serialize_orchard_tree failed at h={cur_tip}: {e}");
+                    }
+                }
+            }
+        }
+
+
         // Anchor debugging
         // {
         //     for i in 0..miner_wallet.chain_tip_h.0 {
@@ -4420,6 +4919,23 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             let action: WalletAction = {
                 let mut wallet_state = wallet_state.lock().unwrap();
+
+                // Drain external stake requests (from the `staking_command` RPC
+                // / auto-stake sidecar) into the in-process action queue. Each
+                // pending request is subject to the same dedupe/gating that a
+                // GUI button press would get via `stake_to_finalizer`.
+                {
+                    let mut q = STAKE_Q.lock().unwrap();
+                    while q.len() > 0 {
+                        let i = q.read_o as usize % q.data.len();
+                        if let Some(pending) = q.data[i].take() {
+                            q.read_o += 1;
+                            wallet_state.stake_to_finalizer(pending.amount_zats, pending.finalizer);
+                        } else {
+                            q.read_o += 1;
+                        }
+                    }
+                }
 
                 if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
                 let Some(action) = wallet_state.actions_in_flight.front() else {
