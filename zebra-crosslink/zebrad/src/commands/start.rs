@@ -166,6 +166,10 @@ impl StartCmd {
         };
         *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
 
+        // Tell the wallet where to read/write its sync snapshot. Mirrors
+        // the path zebrad uses for its own state cache so they age together.
+        *wallet::WALLET_SNAPSHOT_DIR.lock().unwrap() = Some(config.state.cache_dir.clone());
+
         let path_to_pos_store_file = if config.state.ephemeral { std::path::PathBuf::new() } else {
             let mut key_path = config.state.cache_dir.clone();
             let _ = std::fs::create_dir_all(key_path.clone());

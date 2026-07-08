@@ -83,8 +83,11 @@ pub enum TFLServiceResponse {
     Roster(Vec<zcash_primitives::transaction::RosterMember>),
     /// Fat pointer to the BFT chain tip
     FatPointerToBFTChainTip(zcash_primitives::bft::FatPointerToBftBlock),
-    /// Send a staking command transaction
-    StakingCmd,
+    /// Reply to a staking command. The carried String is command-specific:
+    /// - `stake <amt> <hex>` returns `"ok"` on success
+    /// - `info` returns a JSON snapshot of the wallet state
+    /// - `help` returns a human-readable usage string
+    StakingCmd(String),
     /// Faucet
     Faucet(Result<u64, String>),
     /// Response to [`ReadRequest::TotalIssuanceFromKey`]

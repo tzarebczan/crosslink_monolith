@@ -1221,6 +1221,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             .await
             .finalizers_at_current_height
             .clone();
+        let initial_unsorted_roster = unsorted_roster.clone();
+
+        let mut new_final_hash = ZebBlockHash([0; 32]);
+        let mut new_final_height = ZebBlockHeight(0);
 
         use tenderlink::FinalizerPeerAddress;
         // Note(Sam): We do not support human names in the start config for now.
@@ -1308,15 +1312,29 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 unsorted_roster = new_roster;
             }
             pos_file.set_len(valid_byte_count).unwrap();
-        }
 
-        let mut new_final_hash = ZebBlockHash([0; 32]);
-        let mut new_final_height = ZebBlockHeight(0);
+            if let Some(new_block) = i_bft_blocks.last() {
+                new_final_hash.0 =
+                    BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
 
-        if let Some(new_block) = i_bft_blocks.last() {
-            new_final_hash.0 = BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
-            new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
-//println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
+                if let Some(height) = block_height_from_hash(&call, new_final_hash).await {
+                    new_final_height = height;
+                    //println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
+                } else {
+                    warn!(
+                        ?new_final_hash,
+                        pos_chain = ?path_to_pos_store_file,
+                        "ignoring persisted BFT chain because its finalization candidate is missing from the active state cache"
+                    );
+
+                    pos_file.set_len(0).unwrap();
+                    ingest_data_for_tenderlink.clear();
+                    i_bft_blocks.clear();
+                    fat_pointer_to_tip = FatPointerToBftBlock::null();
+                    unsorted_roster = initial_unsorted_roster.clone();
+                    new_final_hash = ZebBlockHash([0; 32]);
+                }
+            }
         }
 
         let roster = {
@@ -1809,7 +1827,6 @@ async fn tfl_service_incoming_request(
                 total_issuance_from_key(internal_handle.clone(), ufvk_str, first_height, last_height).await
             }))
         }
-
         // crosslink direct
         TFLServiceRequest::FinalizersRecencyStatus => {
             let internal = internal_handle.internal.lock().await;
@@ -1817,7 +1834,83 @@ async fn tfl_service_incoming_request(
             Ok(TFLServiceResponse::FinalizersRecencyStatus(internal.recency_status.clone()))
         }
 
-        TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
+        // Handle `staking_command` RPC sub-commands. Supported:
+        //   * "stake <amount_zats> <finalizer_hex>" -- queue a CreateNewDelegationBond
+        //   * "info"                                -- return JSON snapshot of wallet
+        //   * "wipe-snapshot"                       -- drop a marker file to wipe wallet persistence
+        //   * "help"                                -- list available sub-commands
+        //
+        // Hex is decoded in the natural (big-endian) byte order that matches
+        // the roster JSON's `pub_key` field. See `tools/sidecar/README.md`.
+        TFLServiceRequest::StakingCmd(cmd) => {
+            let result: Result<String, String> = (|| -> Result<String, String> {
+                let trimmed = cmd.trim();
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.is_empty() {
+                    return Err("empty command; try `help`".to_owned());
+                }
+                match parts[0] {
+                    "stake" => {
+                        if parts.len() != 3 {
+                            return Err("usage: stake <amount_zats> <finalizer_hex>".to_owned());
+                        }
+                        let amount: u64 = parts[1]
+                            .parse()
+                            .map_err(|e| format!("bad amount: {e}"))?;
+                        let finalizer_bytes = hex::decode(parts[2])
+                            .map_err(|e| format!("bad finalizer hex: {e}"))?;
+                        if finalizer_bytes.len() != 32 {
+                            return Err(format!(
+                                "finalizer must be 32 bytes (got {})",
+                                finalizer_bytes.len()
+                            ));
+                        }
+                        let mut finalizer = [0u8; 32];
+                        finalizer.copy_from_slice(&finalizer_bytes);
+
+                        let closure = wallet::STAKE_REQUEST.lock().unwrap();
+                        match closure.as_ref() {
+                            Some(closure) => (closure.0)(amount, finalizer).map(|_| "ok".to_owned()),
+                            None => Err("wallet not ready".to_owned()),
+                        }
+                    }
+                    "info" => {
+                        let closure = wallet::WALLET_INFO.lock().unwrap();
+                        match closure.as_ref() {
+                            Some(closure) => Ok((closure.0)()),
+                            None => Err("wallet not ready".to_owned()),
+                        }
+                    }
+                    // Drop a marker file the wallet picks up on next launch
+                    // and uses to wipe its persistence + start a fresh sync.
+                    // Takes effect at the next process restart -- the running
+                    // wallet keeps its in-memory state.
+                    "wipe-snapshot" => {
+                        let dir = wallet::WALLET_SNAPSHOT_DIR.lock().unwrap().clone();
+                        match dir {
+                            Some(d) => match wallet::persist::drop_wipe_marker(&d) {
+                                Ok(()) => Ok(format!(
+                                    "wipe marker written; restart zebrad to discard the snapshot ({:?})",
+                                    wallet::persist::wipe_marker_path(&d)
+                                )),
+                                Err(e) => Err(format!("could not write wipe marker: {e}")),
+                            },
+                            None => Err("snapshot dir not configured".to_owned()),
+                        }
+                    }
+                    "help" => Ok(
+                        "sub-commands: `stake <amount_zats> <finalizer_hex>`, `info`, `wipe-snapshot`, `help`"
+                            .to_owned(),
+                    ),
+                    other => Err(format!("unknown sub-command: {other}; try `help`")),
+                }
+            })();
+
+            match result {
+                Ok(s) => Ok(TFLServiceResponse::StakingCmd(s)),
+                Err(e) => Err(TFLServiceError::Misc(e)),
+            }
+        }
 
         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
     }

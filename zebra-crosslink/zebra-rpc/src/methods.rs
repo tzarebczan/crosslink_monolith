@@ -2006,7 +2006,7 @@ where
             .call(TFLServiceRequest::StakingCmd(cmd.clone()))
             .await
         {
-            Ok(TFLServiceResponse::StakingCmd) => Ok(cmd),
+            Ok(TFLServiceResponse::StakingCmd(result)) => Ok(result),
             Ok(_) => unreachable!("unmatched response to a `StakingCmd` request"),
             Err(err) => Err(ErrorObject::owned(
                 server::error::LegacyCode::Verify.into(),

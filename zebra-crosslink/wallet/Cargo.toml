@@ -31,6 +31,7 @@ rand_chacha = "0.3.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 prost = "0.14.1"
+byteorder = { workspace = true }
 tonic = { workspace = true, features = ["transport", "channel", "tls-ring", "tls-webpki-roots"] }
 tonic-build = { workspace = true, default-features = false }
 rustls = { version = "0.23.31", default-features = false, features = ["ring"] }
