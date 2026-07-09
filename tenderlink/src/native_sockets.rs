@@ -954,7 +954,7 @@ mod windows {
             let e = unsafe { WSAGetLastError() };
             if e == WSAEMSGSIZE || e == WSAEWOULDBLOCK || e == WSAENETUNREACH
                 || e == WSAEHOSTUNREACH || e == WSAECONNREFUSED || e == WSAECONNRESET
-                || e == WSAEINVAL {
+                || e == WSAEINVAL || e == WSAENOBUFS {
                 return timestamp_ns;
             }
             panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));

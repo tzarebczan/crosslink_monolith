@@ -898,8 +898,15 @@ impl ReassemblySlot {
     /// returns (success, is_complete)
     pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
 
+        let Some(end_usize) = offset.checked_add(data.len()) else {
+            return (false, false);
+        };
+        if end_usize > MAX_JUMBOGRAM_LEN {
+            return (false, false);
+        }
+
         let start = offset as u32;
-        let end = (offset + data.len()) as u32;
+        let end = end_usize as u32;
 
         // If this is the final fragment, derive total_len from offset + data.len()
         if is_fin {
@@ -910,7 +917,7 @@ impl ReassemblySlot {
                     if last_end > end { return (false, false); }
                 }
                 self.total_len = Some(end);
-                self.buf.resize(end as usize, 0);
+                self.buf.resize(end_usize, 0);
             }
         }
 
@@ -929,8 +936,8 @@ impl ReassemblySlot {
         }
 
         // Grow buf if needed (total_len not yet known)
-        if end as usize > self.buf.len() {
-            self.buf.resize(end as usize, 0);
+        if end_usize > self.buf.len() {
+            self.buf.resize(end_usize, 0);
         }
 
         // Find all ranges that overlap or are adjacent to [start, end)
@@ -950,7 +957,7 @@ impl ReassemblySlot {
         }
 
         // Write new data (overlapping parts verified equal)
-        self.buf[offset..offset + data.len()].copy_from_slice(data);
+        self.buf[offset..end_usize].copy_from_slice(data);
 
         // Merge: union of [start, end) with all overlapping/adjacent ranges
         let merged_start = if first < last { self.received[first].0.min(start) } else { start };
@@ -971,6 +978,7 @@ pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into ma
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
+const ACK_TRACKING_PACKET_CAPACITY: u64 = 2048 * 64;
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
 #[derive(Default)]
@@ -1618,7 +1626,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 if !success {
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
-                                    assert!(success);
+                                    if !success {
+                                        if OVERLY_VERBOSE { println!("Error, oversized or invalid jumbogram fragment from {connection_key:?}. Disconnecting..."); }
+                                        connections_map.remove(&connection_key);
+                                        break 'conn;
+                                    }
                                 }
                                 if complete {
                                     let completed = std::mem::replace(&mut existing_connection.unreliable_reassembly[slot_idx], ReassemblySlot::new());
@@ -1839,9 +1851,9 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         let time_to_considered_dropped = (state.RTT_mean as u64 * 100_000 * 2).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
                         
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
-                        assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
+                        assert!(state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) < ACK_TRACKING_PACKET_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
-                            let bit_index = state.packets_waiting_ack_tail % PACKETS_WAITING_ACK_CAPACITY;
+                            let bit_index = state.packets_waiting_ack_tail % ACK_TRACKING_PACKET_CAPACITY;
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
@@ -1955,7 +1967,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
-                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
+                        if state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) < ACK_TRACKING_PACKET_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
                             let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
                             let virtual_nonce = state.send_sequence_number;
@@ -1983,7 +1995,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 
                         connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
                         connection_tracking_data.unreliable_send_buffer.cut_to_size();
-                        while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
+                        while state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) < ACK_TRACKING_PACKET_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
