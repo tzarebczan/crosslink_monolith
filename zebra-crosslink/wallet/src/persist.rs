@@ -380,6 +380,10 @@ fn write_blob<W: Write>(w: &mut W, b: &[u8]) -> Result<()> {
 
 fn read_blob<R: Read>(r: &mut R) -> Result<Vec<u8>> {
     let n = r.read_u64::<LE>()? as usize;
+    const MAX_BLOB_SIZE: usize = 256 * 1024 * 1024; // 256 MiB sanity cap
+    if n > MAX_BLOB_SIZE {
+        return Err(PersistError::InvalidValue("blob too large"));
+    }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
     Ok(buf)
@@ -925,7 +929,7 @@ fn write_hashmap_b32_u64<W: Write>(w: &mut W, m: &HashMap<[u8; 32], u64>) -> Res
 
 fn read_hashmap_b32_u64<R: Read>(r: &mut R) -> Result<HashMap<[u8; 32], u64>> {
     let n = r.read_u64::<LE>()? as usize;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(n.min(1024 * 1024));
     for _ in 0..n {
         let k = read_b32(r)?;
         let v = r.read_u64::<LE>()?;
