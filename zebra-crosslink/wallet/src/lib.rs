@@ -3561,7 +3561,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
     const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 64;
-    let mut time_since_last_transparent_shielded = std::time::Instant::now() - std::time::Duration::from_secs(1000);
+    let mut time_since_last_transparent_shielded = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1000)).unwrap_or_else(std::time::Instant::now);
 
     let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
 
@@ -3862,7 +3862,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut auto_spend = (false,);
 
-    let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
+    let mut faucet_shield_cooldown_instant = Instant::now().checked_sub(Duration::from_secs(1000)).unwrap_or_else(Instant::now);
 
     let mut proposed_faucet = ProposedTx::EMPTY;
     let mut proposed_miner_shield = ProposedTx::EMPTY;
