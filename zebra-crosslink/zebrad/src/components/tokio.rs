@@ -126,6 +126,10 @@ mod imp {
             "received {}, starting shutdown",
             name,
         );
+
+        // Give the wallet task time to detect the shutdown flag and flush
+        // its snapshot before the runtime begins dropping tasks.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
 
@@ -150,5 +154,9 @@ mod imp {
             target: "zebrad::signal",
             "received Ctrl-C, starting shutdown",
         );
+
+        // Give the wallet task time to detect the shutdown flag and flush
+        // its snapshot before the runtime begins dropping tasks.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
