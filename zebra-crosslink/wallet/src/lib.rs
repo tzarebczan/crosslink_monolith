@@ -445,6 +445,8 @@ pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 /// persistence is disabled and every restart is a full sync.
 pub static WALLET_SNAPSHOT_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
+pub static WALLET_SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
 
 pub fn get_tfl_recency_status_str() -> Option<String> {
@@ -3874,6 +3876,35 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut just_init_new_tx = false;
     let mut resync_c = 0;
     'outer_sync: loop {
+        if WALLET_SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(p) = snapshot_path.as_ref() {
+                let cur_tip = pow_cache.next_tip_h.saturating_sub(1) as u32;
+                if cur_tip > 0 {
+                    match persist::serialize_orchard_tree(&mut orchard_tree) {
+                        Ok(blob) => {
+                            let snap = persist::Snapshot {
+                                network_type: zcash_protocol::consensus::NetworkType::Test,
+                                genesis_hash,
+                                miner_wallet: &miner_wallet,
+                                user_wallet: &user_wallet,
+                                orchard_tree_blob: blob,
+                                pow_cache: &pow_cache,
+                                anchors: &anchors,
+                            };
+                            if let Err(e) = persist::save(p, &snap) {
+                                println!("wallet: shutdown save failed at h={cur_tip}: {e}");
+                            } else {
+                                println!("wallet: shutdown save at h={cur_tip} (anchors={})", anchors.anchors.len());
+                            }
+                        }
+                        Err(e) => println!("wallet: shutdown serialize failed: {e}"),
+                    }
+                }
+            }
+            println!("wallet: shutting down");
+            break 'outer_sync;
+        }
+
         if TEST_FAUCET {
             println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
             println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: miner_ua_str.clone() }).await);

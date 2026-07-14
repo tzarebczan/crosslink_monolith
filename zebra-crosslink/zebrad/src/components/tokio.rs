@@ -115,6 +115,7 @@ mod imp {
             .await;
 
         zebra_chain::shutdown::set_shutting_down();
+        wallet::WALLET_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
 
         #[cfg(feature = "progress-bar")]
         howudoin::disable();
@@ -139,6 +140,7 @@ mod imp {
             .expect("listening for ctrl-c signal should never fail");
 
         zebra_chain::shutdown::set_shutting_down();
+        wallet::WALLET_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
 
         #[cfg(feature = "progress-bar")]
         howudoin::disable();
