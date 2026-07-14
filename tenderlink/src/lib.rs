@@ -1083,6 +1083,7 @@ impl TMState {
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
+                break; // rounds_data was just retained; loop range is stale
             }
 
             // line 55: round catchup
