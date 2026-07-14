@@ -1067,10 +1067,11 @@ impl TMState {
                 // new roster by the decided-block closure).
                 self.vote_namespace = new_vote_namespace;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
-                self.rounds_data.retain(|r| r.height < self.height);
+                self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
+                break; // rounds_data was just retained; loop range is stale
             }
 
             // line 55: round catchup
