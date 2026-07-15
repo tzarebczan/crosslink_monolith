@@ -3583,7 +3583,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     // ---- Snapshot resume / wipe handling --------------------------------
     let snapshot_dir = WALLET_SNAPSHOT_DIR.lock().unwrap().clone();
-    let snapshot_path: Option<std::path::PathBuf> =
+    let mut snapshot_path: Option<std::path::PathBuf> =
         snapshot_dir.as_ref().map(|d| persist::snapshot_path(d));
     let mut anchors = persist::AnchorHistory::default();
     let mut last_saved_h: u32 = 0;
@@ -3876,6 +3876,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut just_init_new_tx = false;
     let mut resync_c = 0;
     'outer_sync: loop {
+        // Lazily pick up WALLET_SNAPSHOT_DIR if it was set after wallet init
+        // (happens in viz_gui mode where start.rs runs after application.rs boots).
+        if snapshot_path.is_none() {
+            if let Some(d) = WALLET_SNAPSHOT_DIR.lock().unwrap().clone() {
+                snapshot_path = Some(persist::snapshot_path(&d));
+                println!("wallet: snapshot path set late: {:?}", snapshot_path);
+            }
+        }
+
         if WALLET_SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(p) = snapshot_path.as_ref() {
                 let cur_tip = pow_cache.next_tip_h.saturating_sub(1) as u32;
