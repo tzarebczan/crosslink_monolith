@@ -3879,7 +3879,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // Lazily pick up WALLET_SNAPSHOT_DIR if it was set after wallet init
         // (happens in viz_gui mode where start.rs runs after application.rs boots).
         if snapshot_path.is_none() {
-            if let Some(d) = WALLET_SNAPSHOT_DIR.lock().unwrap().clone() {
+            let dir = WALLET_SNAPSHOT_DIR.lock().unwrap().clone();
+            if let Some(d) = dir {
                 snapshot_path = Some(persist::snapshot_path(&d));
                 println!("wallet: snapshot path set late: {:?}", snapshot_path);
             }
@@ -4853,6 +4854,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             const SAVE_EVERY_BLOCKS: u32 = 100;
             let cur_tip = wallets_sync_h.0;
             let progressed = cur_tip.saturating_sub(last_saved_h) >= SAVE_EVERY_BLOCKS;
+            static SAVE_DIAG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let diag_n = SAVE_DIAG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if diag_n % 30 == 0 {
+                println!("wallet: snapshot check: cur_tip={cur_tip} last_saved_h={last_saved_h} progressed={progressed} path={p:?}");
+            }
             if progressed && cur_tip > 0 {
                 let stream_heights: Vec<u32> = miner_wallet
                     .strms
