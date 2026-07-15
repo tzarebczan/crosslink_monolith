@@ -594,17 +594,6 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
         let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
         let wallet_state2 = wallet_state.clone();
 
-        // Set the snapshot dir before spawning the wallet thread. start.rs does
-        // this in the headless path but the viz_gui path boots earlier and
-        // config isn't available yet -- use the default cache dir.
-        if *wallet::WALLET_SNAPSHOT_DIR.lock().unwrap() == None {
-            if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-                let mut cache_dir = std::path::PathBuf::from(local_app_data);
-                cache_dir.push("zebra");
-                *wallet::WALLET_SNAPSHOT_DIR.lock().unwrap() = Some(cache_dir);
-            }
-        }
-
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
